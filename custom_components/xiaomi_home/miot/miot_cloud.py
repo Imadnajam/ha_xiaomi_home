@@ -51,10 +51,9 @@ import json
 import logging
 import re
 import time
-from functools import partial
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlencode
-import requests
+import aiohttp
 
 # pylint: disable=relative-beyond-top-level
 from .common import calc_group_id
@@ -71,8 +70,9 @@ TOKEN_EXPIRES_TS_RATIO = 0.7
 
 class MIoTOauthClient:
     """oauth agent url, default: product env."""
-    _main_loop: asyncio.AbstractEventLoop = None
-    _oauth_host: str = None
+    _main_loop: asyncio.AbstractEventLoop
+    _session: aiohttp.ClientSession
+    _oauth_host: str
     _client_id: int
     _redirect_url: str
 
@@ -94,9 +94,11 @@ class MIoTOauthClient:
             self._oauth_host = DEFAULT_OAUTH2_API_HOST
         else:
             self._oauth_host = f'{cloud_server}.{DEFAULT_OAUTH2_API_HOST}'
+        self._session = aiohttp.ClientSession(loop=self._main_loop)
 
-    async def __call_async(self, func):
-        return await self._main_loop.run_in_executor(executor=None, func=func)
+    async def deinit_async(self) -> None:
+        if self._session and not self._session.closed:
+            await self._session.close()
 
     def set_redirect_url(self, redirect_url: str) -> None:
         if not isinstance(redirect_url, str) or redirect_url.strip() == '':
@@ -140,21 +142,22 @@ class MIoTOauthClient:
 
         return f'{OAUTH2_AUTH_URL}?{encoded_params}'
 
-    def _get_token(self, data) -> dict:
-        http_res = requests.get(
+    async def __get_token_async(self, data) -> dict:
+        http_res = await self._session.get(
             url=f'https://{self._oauth_host}/app/v2/ha/oauth/get_token',
             params={'data': json.dumps(data)},
             headers={'content-type': 'application/x-www-form-urlencoded'},
             timeout=MIHOME_HTTP_API_TIMEOUT
         )
-        if http_res.status_code == 401:
+        if http_res.status == 401:
             raise MIoTOauthError(
                 'unauthorized(401)', MIoTErrorCode.CODE_OAUTH_UNAUTHORIZED)
-        if http_res.status_code != 200:
+        if http_res.status != 200:
             raise MIoTOauthError(
-                f'invalid http status code, {http_res.status_code}')
+                f'invalid http status code, {http_res.status}')
 
-        res_obj = http_res.json()
+        res_str = await http_res.text()
+        res_obj = json.loads(res_str)
         if (
             not res_obj
             or res_obj.get('code', None) != 0
@@ -172,7 +175,7 @@ class MIoTOauthClient:
                 (res_obj['result'].get('expires_in', 0)*TOKEN_EXPIRES_TS_RATIO))
         }
 
-    def get_access_token(self, code: str) -> dict:
+    async def get_access_token_async(self, code: str) -> dict:
         """get access token by authorization code
 
         Args:
@@ -184,16 +187,13 @@ class MIoTOauthClient:
         if not isinstance(code, str):
             raise MIoTOauthError('invalid code')
 
-        return self._get_token(data={
+        return await self.__get_token_async(data={
             'client_id': self._client_id,
             'redirect_uri': self._redirect_url,
             'code': code,
         })
 
-    async def get_access_token_async(self, code: str) -> dict:
-        return await self.__call_async(partial(self.get_access_token, code))
-
-    def refresh_access_token(self, refresh_token: str) -> dict:
+    async def refresh_access_token_async(self, refresh_token: str) -> dict:
         """get access token  by refresh token.
 
         Args:
@@ -205,15 +205,11 @@ class MIoTOauthClient:
         if not isinstance(refresh_token, str):
             raise MIoTOauthError('invalid refresh_token')
 
-        return self._get_token(data={
+        return await self.__get_token_async(data={
             'client_id': self._client_id,
             'redirect_uri': self._redirect_url,
             'refresh_token': refresh_token,
         })
-
-    async def refresh_access_token_async(self, refresh_token: str) -> dict:
-        return await self.__call_async(
-            partial(self.refresh_access_token, refresh_token))
 
 
 class MIoTHttpClient:
@@ -222,25 +218,26 @@ class MIoTHttpClient:
     GET_PROP_AGGREGATE_INTERVAL: float = 0.2
     GET_PROP_MAX_REQ_COUNT = 150
     _main_loop: asyncio.AbstractEventLoop
+    _session: aiohttp.ClientSession
     _host: str
     _base_url: str
     _client_id: str
     _access_token: str
 
-    _get_prop_timer: asyncio.TimerHandle
-    _get_prop_list: dict[str, dict[str, asyncio.Future | str | bool]]
+    _get_prop_timer: Optional[asyncio.TimerHandle]
+    _get_prop_list: dict[str, dict]
 
     def __init__(
             self, cloud_server: str, client_id: str, access_token: str,
             loop: Optional[asyncio.AbstractEventLoop] = None
     ) -> None:
         self._main_loop = loop or asyncio.get_running_loop()
-        self._host = None
-        self._base_url = None
-        self._client_id = None
-        self._access_token = None
+        self._host = DEFAULT_OAUTH2_API_HOST
+        self._base_url = ''
+        self._client_id = ''
+        self._access_token = ''
 
-        self._get_prop_timer: asyncio.TimerHandle = None
+        self._get_prop_timer = None
         self._get_prop_list = {}
 
         if (
@@ -254,10 +251,19 @@ class MIoTHttpClient:
             cloud_server=cloud_server, client_id=client_id,
             access_token=access_token)
 
-    async def __call_async(self, func) -> any:
-        if self._main_loop is None:
-            raise MIoTHttpError('miot http, un-support async methods')
-        return await self._main_loop.run_in_executor(executor=None, func=func)
+        self._session = aiohttp.ClientSession(loop=self._main_loop)
+
+    async def deinit_async(self) -> None:
+        if self._get_prop_timer:
+            self._get_prop_timer.cancel()
+            self._get_prop_timer = None
+        for item in self._get_prop_list.values():
+            fut: Optional[asyncio.Future] = item.get('fut', None)
+            if fut:
+                fut.cancel()
+        self._get_prop_list.clear()
+        if self._session and not self._session.closed:
+            await self._session.close()
 
     def update_http_header(
         self, cloud_server: Optional[str] = None,
@@ -265,9 +271,7 @@ class MIoTHttpClient:
         access_token: Optional[str] = None
     ) -> None:
         if isinstance(cloud_server, str):
-            if cloud_server == 'cn':
-                self._host = DEFAULT_OAUTH2_API_HOST
-            else:
+            if cloud_server != 'cn':
                 self._host = f'{cloud_server}.{DEFAULT_OAUTH2_API_HOST}'
             self._base_url = f'https://{self._host}'
         if isinstance(client_id, str):
@@ -276,36 +280,35 @@ class MIoTHttpClient:
             self._access_token = access_token
 
     @property
-    def __api_session(self) -> requests.Session:
-        session = requests.Session()
-        session.headers.update({
+    def __api_request_headers(self) -> dict:
+        return {
             'Host': self._host,
             'X-Client-BizId': 'haapi',
             'Content-Type': 'application/json',
             'Authorization': f'Bearer{self._access_token}',
             'X-Client-AppId': self._client_id,
-        })
-        return session
+        }
 
-    def mihome_api_get(
+    # pylint: disable=unused-private-member
+    async def __mihome_api_get_async(
         self, url_path: str, params: dict,
         timeout: int = MIHOME_HTTP_API_TIMEOUT
     ) -> dict:
-        http_res = None
-        with self.__api_session as session:
-            http_res = session.get(
-                url=f'{self._base_url}{url_path}',
-                params=params,
-                timeout=timeout)
-        if http_res.status_code == 401:
+        http_res = await self._session.get(
+            url=f'{self._base_url}{url_path}',
+            params=params,
+            headers=self.__api_request_headers,
+            timeout=timeout)
+        if http_res.status == 401:
             raise MIoTHttpError(
                 'mihome api get failed, unauthorized(401)',
                 MIoTErrorCode.CODE_HTTP_INVALID_ACCESS_TOKEN)
-        if http_res.status_code != 200:
+        if http_res.status != 200:
             raise MIoTHttpError(
-                f'mihome api get failed, {http_res.status_code}, '
+                f'mihome api get failed, {http_res.status}, '
                 f'{url_path}, {params}')
-        res_obj: dict = http_res.json()
+        res_str = await http_res.text()
+        res_obj: dict = json.loads(res_str)
         if res_obj.get('code', None) != 0:
             raise MIoTHttpError(
                 f'invalid response code, {res_obj.get("code",None)}, '
@@ -315,28 +318,25 @@ class MIoTHttpClient:
             self._base_url, url_path, params, res_obj)
         return res_obj
 
-    def mihome_api_post(
+    async def __mihome_api_post_async(
         self, url_path: str, data: dict,
         timeout: int = MIHOME_HTTP_API_TIMEOUT
     ) -> dict:
-        encoded_data = None
-        if data:
-            encoded_data = json.dumps(data).encode('utf-8')
-        http_res = None
-        with self.__api_session as session:
-            http_res = session.post(
-                url=f'{self._base_url}{url_path}',
-                data=encoded_data,
-                timeout=timeout)
-        if http_res.status_code == 401:
+        http_res = await self._session.post(
+            url=f'{self._base_url}{url_path}',
+            json=data,
+            headers=self.__api_request_headers,
+            timeout=timeout)
+        if http_res.status == 401:
             raise MIoTHttpError(
                 'mihome api get failed, unauthorized(401)',
                 MIoTErrorCode.CODE_HTTP_INVALID_ACCESS_TOKEN)
-        if http_res.status_code != 200:
+        if http_res.status != 200:
             raise MIoTHttpError(
-                f'mihome api post failed, {http_res.status_code}, '
+                f'mihome api post failed, {http_res.status}, '
                 f'{url_path}, {data}')
-        res_obj: dict = http_res.json()
+        res_str = await http_res.text()
+        res_obj: dict = json.loads(res_str)
         if res_obj.get('code', None) != 0:
             raise MIoTHttpError(
                 f'invalid response code, {res_obj.get("code",None)}, '
@@ -346,16 +346,17 @@ class MIoTHttpClient:
             self._base_url, url_path, data, res_obj)
         return res_obj
 
-    def get_user_info(self) -> dict:
-        http_res = requests.get(
+    async def get_user_info_async(self) -> dict:
+        http_res = await self._session.get(
             url='https://open.account.xiaomi.com/user/profile',
-            params={'clientId': self._client_id,
-                    'token': self._access_token},
+            params={
+                'clientId': self._client_id, 'token': self._access_token},
             headers={'content-type': 'application/x-www-form-urlencoded'},
             timeout=MIHOME_HTTP_API_TIMEOUT
         )
 
-        res_obj = http_res.json()
+        res_str = await http_res.text()
+        res_obj = json.loads(res_str)
         if (
             not res_obj
             or res_obj.get('code', None) != 0
@@ -366,14 +367,11 @@ class MIoTHttpClient:
 
         return res_obj['data']
 
-    async def get_user_info_async(self) -> dict:
-        return await self.__call_async(partial(self.get_user_info))
-
-    def get_central_cert(self, csr: str) -> Optional[str]:
+    async def get_central_cert_async(self, csr: str) -> Optional[str]:
         if not isinstance(csr, str):
             raise MIoTHttpError('invalid params')
 
-        res_obj: dict = self.mihome_api_post(
+        res_obj: dict = await self.__mihome_api_post_async(
             url_path='/app/v2/ha/oauth/get_central_crt',
             data={
                 'csr': str(base64.b64encode(csr.encode('utf-8')), 'utf-8')
@@ -387,11 +385,10 @@ class MIoTHttpClient:
 
         return cert
 
-    async def get_central_cert_async(self, csr: str) -> Optional[str]:
-        return await self.__call_async(partial(self.get_central_cert, csr))
-
-    def __get_dev_room_page(self, max_id: str = None) -> dict:
-        res_obj = self.mihome_api_post(
+    async def __get_dev_room_page_async(
+        self, max_id: Optional[str] = None
+    ) -> dict:
+        res_obj = await self.__mihome_api_post_async(
             url_path='/app/v2/homeroom/get_dev_room_page',
             data={
                 'start_id': max_id,
@@ -419,7 +416,7 @@ class MIoTHttpClient:
             res_obj['result'].get('has_more', False)
             and isinstance(res_obj['result'].get('max_id', None), str)
         ):
-            next_list = self.__get_dev_room_page(
+            next_list = await self.__get_dev_room_page_async(
                 max_id=res_obj['result']['max_id'])
             for home_id, info in next_list.items():
                 home_list.setdefault(home_id, {'dids': [], 'room_info': {}})
@@ -432,8 +429,8 @@ class MIoTHttpClient:
 
         return home_list
 
-    def get_homeinfos(self) -> dict:
-        res_obj = self.mihome_api_post(
+    async def get_homeinfos_async(self) -> dict:
+        res_obj = await self.__mihome_api_post_async(
             url_path='/app/v2/homeroom/gethome',
             data={
                 'limit': 150,
@@ -446,7 +443,7 @@ class MIoTHttpClient:
         if 'result' not in res_obj:
             raise MIoTHttpError('invalid response result')
 
-        uid: str = None
+        uid: Optional[str] = None
         home_infos: dict = {}
         for device_source in ['homelist', 'share_home_list']:
             home_infos.setdefault(device_source, {})
@@ -485,7 +482,7 @@ class MIoTHttpClient:
             res_obj['result'].get('has_more', False)
             and isinstance(res_obj['result'].get('max_id', None), str)
         ):
-            more_list = self.__get_dev_room_page(
+            more_list = await self.__get_dev_room_page_async(
                 max_id=res_obj['result']['max_id'])
             for home_id, info in more_list.items():
                 if home_id not in home_infos['homelist']:
@@ -507,17 +504,11 @@ class MIoTHttpClient:
             'share_home_list': home_infos.get('share_home_list', [])
         }
 
-    async def get_homeinfos_async(self) -> dict:
-        return await self.__call_async(self.get_homeinfos)
-
-    def get_uid(self) -> str:
-        return self.get_homeinfos().get('uid', None)
-
     async def get_uid_async(self) -> str:
         return (await self.get_homeinfos_async()).get('uid', None)
 
-    def __get_device_list_page(
-        self, dids: list[str], start_did: str = None
+    async def __get_device_list_page_async(
+        self, dids: list[str], start_did: Optional[str] = None
     ) -> dict[str, dict]:
         req_data: dict = {
             'limit': 200,
@@ -527,7 +518,7 @@ class MIoTHttpClient:
         if start_did:
             req_data['start_did'] = start_did
         device_infos: dict = {}
-        res_obj = self.mihome_api_post(
+        res_obj = await self.__mihome_api_post_async(
             url_path='/app/v2/home/device_list_page',
             data=req_data
         )
@@ -578,17 +569,16 @@ class MIoTHttpClient:
 
         next_start_did = res_obj.get('next_start_did', None)
         if res_obj.get('has_more', False) and next_start_did:
-            device_infos.update(self.__get_device_list_page(
+            device_infos.update(await self.__get_device_list_page_async(
                 dids=dids, start_did=next_start_did))
 
         return device_infos
 
     async def get_devices_with_dids_async(
         self, dids: list[str]
-    ) -> dict[str, dict]:
+    ) -> Optional[dict[str, dict]]:
         results: list[dict[str, dict]] = await asyncio.gather(
-            *[self.__call_async(
-                partial(self.__get_device_list_page, dids[index:index+150]))
+            *[self.__get_device_list_page_async(dids=dids[index:index+150])
                 for index in range(0, len(dids), 150)])
         devices = {}
         for result in results:
@@ -598,10 +588,10 @@ class MIoTHttpClient:
         return devices
 
     async def get_devices_async(
-        self, home_ids: list[str] = None
+        self, home_ids: Optional[list[str]] = None
     ) -> dict[str, dict]:
         homeinfos = await self.get_homeinfos_async()
-        homes: dict[str, dict[str, any]] = {}
+        homes: dict[str, dict[str, Any]] = {}
         devices: dict[str, dict] = {}
         for device_type in ['home_list', 'share_home_list']:
             homes.setdefault(device_type, {})
@@ -638,8 +628,9 @@ class MIoTHttpClient:
                             'group_id': group_id
                         } for did in room_info.get('dids', [])})
         dids = sorted(list(devices.keys()))
-        results: dict[str, dict] = await self.get_devices_with_dids_async(
-            dids=dids)
+        results = await self.get_devices_with_dids_async(dids=dids)
+        if results is None:
+            raise MIoTHttpError('get devices failed')
         for did in dids:
             if did not in results:
                 devices.pop(did, None)
@@ -665,12 +656,12 @@ class MIoTHttpClient:
             'devices': devices
         }
 
-    def get_props(self, params: list) -> list:
+    async def get_props_async(self, params: list) -> list:
         """
         params = [{"did": "xxxx", "siid": 2, "piid": 1},
                     {"did": "xxxxxx", "siid": 2, "piid": 2}]
         """
-        res_obj = self.mihome_api_post(
+        res_obj = await self.__mihome_api_post_async(
             url_path='/app/v2/miotspec/prop/get',
             data={
                 'datasource': 1,
@@ -681,11 +672,8 @@ class MIoTHttpClient:
             raise MIoTHttpError('invalid response result')
         return res_obj['result']
 
-    async def get_props_async(self, params: list) -> list:
-        return await self.__call_async(partial(self.get_props, params))
-
-    def get_prop(self, did: str, siid: int, piid: int) -> any:
-        results = self.get_props(
+    async def __get_prop_async(self, did: str, siid: int, piid: int) -> Any:
+        results = await self.get_props_async(
             params=[{'did': did, 'siid': siid, 'piid': piid}])
         if not results:
             return None
@@ -711,7 +699,7 @@ class MIoTHttpClient:
         if not props_buffer:
             _LOGGER.error('get prop error, empty request list')
             return False
-        results = await self.__call_async(partial(self.get_props, props_buffer))
+        results = await self.get_props_async(props_buffer)
 
         for result in results:
             if not all(
@@ -720,7 +708,7 @@ class MIoTHttpClient:
             key = f'{result["did"]}.{result["siid"]}.{result["piid"]}'
             prop_obj = self._get_prop_list.pop(key, None)
             if prop_obj is None:
-                _LOGGER.error('get prop error, key not exists, %s', result)
+                _LOGGER.info('get prop error, key not exists, %s', result)
                 continue
             prop_obj['fut'].set_result(result['value'])
             props_req.remove(key)
@@ -731,7 +719,7 @@ class MIoTHttpClient:
                 continue
             prop_obj['fut'].set_result(None)
         if props_req:
-            _LOGGER.error(
+            _LOGGER.info(
                 'get prop from cloud failed, %s, %s', len(key), props_req)
 
         if self._get_prop_list:
@@ -745,10 +733,9 @@ class MIoTHttpClient:
 
     async def get_prop_async(
         self, did: str, siid: int, piid: int, immediately: bool = False
-    ) -> any:
+    ) -> Any:
         if immediately:
-            return await self.__call_async(
-                partial(self.get_prop, did, siid, piid))
+            return await self.__get_prop_async(did, siid, piid)
         key: str = f'{did}.{siid}.{piid}'
         prop_obj = self._get_prop_list.get(key, None)
         if prop_obj:
@@ -766,11 +753,11 @@ class MIoTHttpClient:
 
         return await fut
 
-    def set_prop(self, params: list) -> list:
+    async def set_prop_async(self, params: list) -> list:
         """
         params = [{"did": "xxxx", "siid": 2, "piid": 1, "value": False}]
         """
-        res_obj = self.mihome_api_post(
+        res_obj = await self.__mihome_api_post_async(
             url_path='/app/v2/miotspec/prop/set',
             data={
                 'params': params
@@ -782,20 +769,14 @@ class MIoTHttpClient:
 
         return res_obj['result']
 
-    async def set_prop_async(self, params: list) -> list:
-        """
-        params = [{"did": "xxxx", "siid": 2, "piid": 1, "value": False}]
-        """
-        return await self.__call_async(partial(self.set_prop, params))
-
-    def action(
+    async def action_async(
         self, did: str, siid: int, aiid: int, in_list: list[dict]
     ) -> dict:
         """
         params = {"did": "xxxx", "siid": 2, "aiid": 1, "in": []}
         """
         # NOTICE: Non-standard action param
-        res_obj = self.mihome_api_post(
+        res_obj = await self.__mihome_api_post_async(
             url_path='/app/v2/miotspec/action',
             data={
                 'params': {
@@ -810,9 +791,3 @@ class MIoTHttpClient:
             raise MIoTHttpError('invalid response result')
 
         return res_obj['result']
-
-    async def action_async(
-        self, did: str, siid: int, aiid: int, in_list: list[dict]
-    ) -> dict:
-        return await self.__call_async(
-            partial(self.action, did, siid, aiid, in_list))
